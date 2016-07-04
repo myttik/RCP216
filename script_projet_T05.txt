@@ -1,0 +1,292 @@
+
+// export PATH="$PATH:/usr/lib/spark/bin"
+// se mettre dans le bon répertoire + dezipper les fichiers
+// cd projet216
+// copier coller les fichiers et les dézipper
+// cd ..
+// import des jar : wget http://cedric.cnam.fr/~ferecatu/RCP216/tp/tptexte/lsa.jar
+
+// import des librairies
+import org.apache.spark._
+import org.apache.spark.rdd.RDD
+import org.apache.spark.util.IntParam
+import org.apache.spark.graphx._
+import org.apache.spark.graphx.util.GraphGenerators
+import scala.collection.mutable.ListBuffer
+
+
+
+// 1.1 Chargement des données
+
+val socialGraph = GraphLoader.edgeListFile(sc,"higgs-social_network.edgelist").cache()
+
+val retweetGraph= GraphLoader.edgeListFile(sc,"higgs-retweet_network.edgelist").cache()
+
+val replyGraph= GraphLoader.edgeListFile(sc,"higgs-reply_network.edgelist").cache()
+
+val mentionGraph= GraphLoader.edgeListFile(sc,"higgs-mention_network.edgelist").cache()
+
+-------
+//1.2 -  Leaders d'opinion - on construit un graphe qui ura des sommets : (Id, followers) et des arcs définis par (source, destination,interactions). "interactions" correspond au nombre de rewteet + nb de réponses + nombre de mentions. Le graphe est orienté.
+//(Mon ordi n'a pas assez de mémoire pour traiter séparément les différents types d'arcs. Je les regroupe donc sous un même libellé "interactions"
+
+
+def edgeToPair(e: Edge[Int]) = ((e.srcId,e.dstId),e.attr)
+
+val RTEdges = retweetGraph.edges.map(edgeToPair)
+val RPEdges = replyGraph.edges.map(edgeToPair)
+val MTEdges = mentionGraph.edges.map(edgeToPair)
+
+val newEdges = RTEdges.union(RPEdges).union(MTEdges).reduceByKey(_+_).map{case((srcId,dstId),intact)=>Edge(srcId,dstId,intact)}
+
+
+/centralité des sommets
+val newVertices0 = socialGraph.outerJoinVertices(socialGraph.degrees){
+ (id,one,degree)=>(degree.getOrElse(0))}
+
+/inDeg
+val newVertices1 = newVertices0.outerJoinVertices(socialGraph.inDegrees){
+ (id,degree,indegree)=>(degree,indegree.getOrElse(0))}
+------
+/Rtd - Nombre de fois où le sommet est retweeté
+val rtdVertices = newVertices1.outerJoinVertices(retweetGraph.inDegrees){
+ (id,degree,rtd)=>(degree._1,degree._2,rtd.getOrElse(0))}
+
+------
+/Rt - Volume de reprise d'information - retweet par sommet
+val rtVertices = rtdVertices.outerJoinVertices(retweetGraph.outDegrees){
+ (id,degree,rt)=>(degree._1,degree._2,degree._3,rt.getOrElse(0))}
+
+------
+/Rp - Volume de réponse - reponse par sommet
+val rpVertices = rtVertices.outerJoinVertices(replyGraph.outDegrees){
+ (id,degree,rp)=>(degree._1,degree._2,degree._3,degree._4,rp.getOrElse(0))}
+
+------
+/Mtd - Nombre de fois où un sommet est mentionné
+val mtdVertices = rpVertices.outerJoinVertices(mentionGraph.inDegrees){
+ (id,degree,mt)=>(degree._1,degree._2,degree._3,degree._4,degree._5,mt.getOrElse(0))}
+
+------
+/un sommet est défini par son Id (VertexId), et ses caractéristiques : nombre de liens sociaux -degré-, nombre de followers-degré entrant-, nombre de fois où il est retweeté, nombre de fois où il a retweeté,nombre de fois où il a répondu, nombre de fois où il a été mentionné
+
+val graph = Graph (mtdVertices.vertices,newEdges).cache()
+
+
+
+---------
+// Popularité d'un individu - on ajoute le critère du PageRank
+//PageRank algorithm - individus les plus populaires sur base du nombre de relation sociales, du nb de followers, du nombre de mentions et de réponses
+// on calcule le Page Rank pour chacun des graphe d'interaction puis on additionne les différents indicateurs
+
+/page rank réseau social
+val prSocial = socialGraph.staticPageRank(5).cache
+
+
+/page rank retweet
+val prRetweet = retweetGraph.staticPageRank(5).cache
+prRetweet.vertices.map(_._2).stats()
+
+/page rank reply
+val prReply = replyGraph.staticPageRank(5).cache
+
+
+/page rank mention
+val prMention = mentionGraph.staticPageRank(5).cache
+
+val pageRank = graph.staticPageRank(5).cache
+
+/on additionne tous ces page rank 
+val totalPR =prSocial.vertices.union(prRetweet.vertices).union(prReply.vertices).union(prMention.vertices).reduceByKey(_+_)
+
+totalPR.map(_._2).stats()
+
+totalPR.top(30){
+  Ordering.by((entry: (VertexId, Double)) => entry._2)}
+
+
+/on ajoute le critère du page rank aux caractéristiques de chaque sommet
+val HiggsGraph = graph.outerJoinVertices(totalPR) {
+  (id, degree,rank) => (degree._1,degree._2,degree._3,degree._4,degree._5,degree._6,rank.getOrElse(0.0))
+}.cache()
+
+HiggsGraph.vertices.take(5).foreach(println)
+
+--------------
+RetweetPageRank.vertices.top(30){
+  Ordering.by((entry: (VertexId, Double)) => entry._2)}
+
+graph.inDegrees.top(30){
+  Ordering.by((entry: (VertexId, Int)) => entry._2)}
+
+retweetGraph.outDegrees.top(30){
+  Ordering.by((entry: (VertexId, Int)) => entry._2)}
+
+/ Remarque : le classement fourni par le page Rank est cohérent avec le classement des sommets par nombre de dégrés entrant
+
+/HiggsGraph est le graphe final qui servira pour le reste des analyses
+
+----------------------------------------------
+
+	//1.4 Données statistiques du graphe Retweet (duplicable pour les autres graphes)
+
+HiggsGraph.numVertices / on a bien toujours le même nb de sommets
+HiggsGraph.numEdges / plus de 15M de liens (sociaux et tweets)
+
+-----densité du graphe
+val density = (2*HiggsGraph.numEdges*1000000/(HiggsGraph.numVertices * HiggsGraph.numVertices)).toDouble
+
+println(s"Le graphe est de densité " + density + " x 10^-6, il est peu dense.")
+ 
+-----densité locale 
+/ TriangleCount détermine le nombre de triangles passant par unn sommet, c'est une mesure de clustering
+
+val HiggsTriangles = HiggsGraph.triangleCount()
+---
+HiggsTriangles.vertices.map(x=>x._2).stats()
+
+val maxTrisGraph = HiggsTriangles.degrees.mapValues(d => d * (d - 1) / 2.0)
+
+val ClusterGraph = HiggsTriangles.innerJoinVertices(maxTrisGraph.vertices) {
+  (id, tgl,clst) => (if (clst == 0) 0
+    else tgl /clst)
+}.cache()
+
+/coefficient de clustering moyen :
+ClusterGraph.map(_._2).sum()/HiggsGraph.numVertices
+
+
+HiggsTriangles.vertices.take(5).foreach(println)
+
+
+
+-----distribution des degrés
+HiggsGraph.degrees.map(_._2).count
+
+/ individus qui ont le plus de liens sociaux (nombre de degrés) - volume des contacts
+HiggsGraph.degrees.top(10){
+  Ordering.by((entry: (VertexId, Int)) => entry._2)}.foreach(println)
+
+-----
+
+/ individus qui ont le plus de liens sociaux (nombre de degrés) - volume des contacts
+socialGraph.degrees.top(10){
+  Ordering.by((entry: (VertexId, Int)) => entry._2)}.foreach(println)
+
+/ Degré de centralité : les individus qui ont le plus de followers
+socialGraph.inDegrees.top(10){
+  Ordering.by((entry: (VertexId, Int)) => entry._2)}.foreach(println)
+
+
+/Volume de reprise d'information - retweet par sommet
+retweetGraph.inDegrees.top(30) {
+  Ordering.by((entry: (VertexId, Int)) => entry._2)
+}.foreach(println)
+
+println("remarque : l'individus 1503 n'a que des liens sortants. Il se peut qu'il ne s'agisse pas d'une personne physique mais d'une "personne morale" : compte twitter relié aux publications d'un journal par exemple.")
+
+
+-----
+//Composants connectés
+
+val cc = HiggsGraph.connectedComponents().vertices
+
+cc.take(5).foreach(println)
+
+/trier les composants - par ordre décroissant
+
+def sortedConnectedComponents(connectedComponents: Graph[VertexId, _]): Seq[(VertexId, Long)] = {
+  val componentCounts = connectedComponents.vertices.map(_._2).countByValue
+  componentCounts.toSeq.sortBy(_._2).reverse
+}
+
+val componentCounts = sortedConnectedComponents(HiggsGraph.connectedComponents())
+componentCounts.size
+componentCounts.take(5).foreach(println)
+
+//Remarque : il y a un gros composant qui réunit quasiment tous les individus du graphe
+ 
+
+
+
+//-------------------------------------------
+
+
+
+//-------Interprétation
+
+ println(s"Le graphe a ${HiggsGraph.numVertices} sommets. On dénombre ${HiggsGraph.numEdges} interactions au total dont ${retweetGraph.numEdges} retweets,  ${replyGraph.numEdges} réponses et  ${mentionGraph.numEdges} mentions.")
+
+
+socialGraph.inDegrees.top(10){
+  Ordering.by((entry: (VertexId, Int)) => entry._2)}.map(x=> "Les autorités sont: " + x._1 + " avec " + x._2 + " followers.").foreach(println)
+
+println("Les leaders opinion - au sens d'Alloing, sont repéables par leurs caractéristiques structurelles (volume des contacts et centralité), cracatéristiques énoncitaives (volume et rythme de production - nous ne disposons pas de ces données), caractéristiques informationnelles (volume de reprise d'information - nombre de retweet)")
+
+HiggsGraph.vertices.top(10){
+  Ordering.by((entry: (VertexId, (Int,Int,Int,Int,Int,Int,Double))) => (entry._2._7,entry._2._2)) }.map(x=> "Les leaders  d'opinion sont:  " + x._1 + " avec un score de popularité de   " + x._2._7.toInt + ". Il a    "  + x._2._2 + "    followers et a été retweeté    " + x._2._3 + "   fois.").foreach(println)
+
+
+
+//------------------------------------------------------------
+//---DYNAMIQUE DES TWEETS
+//------------------------------------------------------------
+
+
+val activityNetwork = sc.textFile("file:///home/kitty/projet216/higgs-activity_time.txt")
+
+/les sommets sont ceux du graphe socialGraph
+
+/les arcs sont créés ci-dessous :
+
+val edges0= activityNetwork .map(x=>{(x.split(" ")(0).toLong,x.split(" ")(1).toLong, x.split(" ")(2).toLong,x.split(" ")(3))}).filter(e => e._4 == "RT").map(x=> (x._1,x._2,x._3))
+
+println(s"Il y a  ${edges0.count}  arcs.")
+
+
+/---Dynamique
+
+def max(a: (Long, Long,Long), b: (Long, Long,Long)): (Long, Long,Long) = { if (a._3 > b._3) a else b}
+
+
+def min (a: (Long, Long,Long), b: (Long, Long,Long)): (Long, Long,Long) = { if (a._3 < b._3) a else b}
+
+
+println(s"Le premier retweet a eu lieu au timestamp : ${edges0.reduce(min)._3}")
+
+println(s"Le dernier retweet a eu lieu au timestamp : ${edges0.reduce(max)._3}")
+
+println(s"La chaîne complète s'est répandue en : ${((edges0.reduce(max)._3-edges0.reduce(min)._3)/60).toInt} minutes soit environ ${((edges0.reduce(max)._3-edges0.reduce(min)._3)/(60*60*24)).toDouble} jours.")
+
+
+---Graphe
+val minT = edges0.reduce(min)._3
+
+val edges : RDD[Edge[Long]] = edges0.map(x=> Edge(x._1,x._2,x._3-minT))
+
+val DynamicGraph = Graph (socialGraph.vertices,edges)
+
+edges0.map(x=>(x._1,x._2,x._3-minT)).saveAsTextFile("Dyn-edges.csv")
+
+----
+val temps =(edges0.reduce(max)._3-edges0.reduce(min)._3)/10
+
+for (i <- 1 to 10){println(s"Au bout de ${i*temps} secondes, le message a été retweeté  ${(edges.filter{case Edge(srcId,dstId,attr) =>attr<= i *temps}.count)}  fois.")}
+
+val seqIntervalles = Seq(0 to 10)
+list = for(i <- 1 to 10) yield (edges.filter{case Edge(srcId,dstId,attr) =>attr<= i *temps}.count)
+val seqRetweet = list.toList
+
+// a partir des deux séquences seqIntervalles et seqRetweet, on peut la courbe des rewteets en fonction du temps ou un histogramme. Je souhaitais le faire à partir du package Wisp mais je n'ai pas réussi à le récupérer de github : https://github.com/quantifind/wisp. Je vais donc sauvegarder ces listes et les tracer par ailleurs.
+
+
+------
+Préparation des données pour la visualisation
+
+
+
+val vertex0 : RDD[(VertexId,Int)] = edges0.map(x=>(x._1,(((x._3-minT)/86660)+1).toInt))
+/--création des arcs : source, destination, temps écoulé
+edges0.map(x=>Edge(x._1,x._2,x._3-minT)).saveAsTextFile("edges.csv")
+/--création des sommets : id, valeur(pagerank), groupe(jour d'apparition)
+totalPR.join(vertex0).saveAsTextFile("nodes.csv")
